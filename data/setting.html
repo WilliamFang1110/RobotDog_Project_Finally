@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>EDA-Robot</title>
+    <style>
+
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            text-align: center;
+        }
+
+        h1 {
+            text-align: center;
+        }
+
+        .button {
+            display: inline-block;
+            height: 30px;
+            width: 300px;
+            margin-top: 20px;
+
+            padding: 10px 20px;
+            background-color: deepskyblue;
+            color: #fff;
+            border: none;
+            border-radius: 20px; /* 添加圆角 */
+            text-decoration: none;
+            line-height: 2; /* 调整文字垂直位置 */
+            text-align: center; /* 文字居中 */
+            box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.2); /* 立体感 */
+            transition: all 0.3s ease; /* 过渡效果 */
+        }
+
+        .button:hover {
+            background-color: skyblue; /* 悬停背景色 */
+            transform: translateY(2px); /* 点击效果 */
+            box-shadow: 2px 2px 8px rgba(0, 0, 0, 0.3); /* 增强立体感 */
+        }
+        .search-box {
+            margin-top: 20px;
+            display: inline-block;
+            height: 30px;
+            width: 300px;
+            padding: 5px 10px;
+            background-color: #f0f0f0;
+            border: 1px solid #ccc;
+            border-radius: 20px;
+            text-align: center; /* 文字居中 */
+        }
+        .hidden {
+            display: none; /* 初始隐藏 */
+        }
+    </style>
+
+</head>
+<body>
+<form action='/connect' method='POST'>
+    <div class='container'>
+        <h1>RobotDog设备配置页</h1>
+        <p>本项目基于ESP8266主控开发</p>
+        
+        <!-- 网络配置 -->
+        <input type='text' name='ssid' placeholder='输入WIFI名称' class='search-box'>
+        <input type='password' name='pass' placeholder='输入WIFI密码' class='search-box'>
+        
+        <!-- 第三方API配置（已交换位置） -->
+        <input type='text' name='baiduMapApi' placeholder='输入百度地图API密钥' class='search-box'>
+        <input type='text' name='api' placeholder='输入心知天气API密钥' class='search-box'>
+        
+        <!-- 提交按钮 -->
+        <input type='submit' style="height: 50px;width: 320px" class='button' value="保存">
+    </div>
+</form>
+</body>
+</html>

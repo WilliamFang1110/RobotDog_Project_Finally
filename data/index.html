@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>RobotDog控制中心</title>
+    <style>
+        body { margin: 0; padding: 0; font-family: Arial, sans-serif; color: #333; }
+        .container { max-width: 800px; margin: 0 auto; padding: 20px; text-align: center; }
+        h1, h3 { text-align: center; }
+        .button {
+            display: inline-block;
+            height: 50px;
+            width: 320px;
+            margin-top: 20px;
+            padding: 0 20px;
+            background-color: deepskyblue;
+            color: #fff;
+            border: none;
+            border-radius: 20px;
+            line-height: 50px;
+            text-align: center;
+            box-shadow: 2px 2px 5px rgba(0,0,0,0.2);
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        .button:hover {
+            background-color: skyblue;
+            transform: translateY(2px);
+            box-shadow: 2px 2px 8px rgba(0,0,0,0.3);
+        }
+        .data-card {
+            margin-top: 30px;
+            padding: 20px;
+            border: 1px solid #d9bfff; /* 淡紫色边框 */
+            border-radius: 12px;
+            box-shadow: 0 0 10px rgba(217, 191, 255, 0.3);
+            display: inline-block;
+            width: 320px;
+            text-align: left;
+            background-color: #f8f0ff; /* 淡紫色背景 */
+        }
+        .data-item { margin: 10px 0; padding: 5px 0; border-bottom: 1px dashed #e6d6ff; }
+        .loading { color: #666; font-style: italic; }
+        .device-info {
+            margin-top: 30px;
+            padding: 20px;
+            border-radius: 10px;
+            background-color: deepskyblue;
+            color: #fff;
+            box-shadow: 2px 2px 5px rgba(0,0,0,0.2);
+        }
+        .device-info table { width: 100%; border-collapse: collapse; }
+        .device-info th, .device-info td { padding: 8px 0; text-align: left; }
+        .device-info a { color: #fff; text-decoration: underline; }
+    </style>
+</head>
+<body>
+<div class='container'>
+    <h1>RobotDog控制中心</h1>
+    <h3>180度限位舵机版</h3>
+    <p>本项目基于ESP8266主控开发</p>
+    
+    <input type='button' class='button' value="遥控器" onclick="window.location.href='./control.html'">
+    <input type='button' class='button' value="配置" onclick="window.location.href='./setting.html'">
+    
+    <!-- 定位/天气数据获取按钮 -->
+    <input type='button' class='button' 
+           value="获取IP定位/天气数据" onclick="getIPLocationAndWeather()">
+    
+    <div class="data-card">
+        <h3 style="text-align: center; margin-top: 0;">定位/天气信息</h3>
+        <div class="data-item">
+            <strong>位置:</strong> <span id="locationInfo" class="loading">未获取数据</span>
+        </div>
+        <div class="data-item">
+            <strong>温度:</strong> <span id="temperature" class="loading">未获取数据</span>
+        </div>
+        <div class="data-item">
+            <strong>天气状况:</strong> <span id="weatherCondition" class="loading">未获取数据</span>
+        </div>
+        <div class="data-item">
+            <strong>更新时间:</strong> <span id="updateTime" class="loading">未更新</span>
+        </div>
+    </div>
+
+    <div class="device-info">
+        <table>
+            <tr><th>设备名称:</th><td>RobotDog</td></tr>
+            <tr><th>内存大小:</th><td>4MB</td></tr>
+            <tr><th>控制台版本:</th><td>V1.0</td></tr>
+            <tr><th>官网:</th><td><a href="https://lceda.cn/">EDA</a></td></tr>
+        </table>
+    </div>
+</div>
+
+<script>
+    // 统一触发IP定位和天气获取
+    function getIPLocationAndWeather() {
+        getIPLocation().then(() => {
+            fetchLocationAndWeather();
+        }).catch(() => {
+            fetchLocationAndWeather(); // 定位失败仍尝试获取天气
+        });
+    }
+
+    // IP定位（城市级精度）
+    function getIPLocation() {
+        return new Promise((resolve, reject) => {
+            const locationEl = document.getElementById('locationInfo');
+            locationEl.textContent = '正在通过IP获取位置...';
+            
+            fetch('/api/ip-location')
+                .then(response => {
+                    if (!response.ok) throw new Error('IP定位接口请求失败');
+                    return response.json();
+                })
+                .then(data => {
+                    if (data.success) {
+                        // IP定位精度：省份+城市
+                        locationEl.textContent = `${data.province}${data.city}`;
+                        resolve();
+                    } else {
+                        locationEl.textContent = `定位失败: ${data.msg}`;
+                        reject(data.msg);
+                    }
+                })
+                .catch(error => {
+                    locationEl.textContent = 'IP定位请求失败';
+                    console.error('IP定位错误:', error);
+                    reject(error);
+                });
+        });
+    }
+
+    // 获取天气数据
+    function fetchLocationAndWeather() {
+        const tempEl = document.getElementById('temperature');
+        //const humidityEl = document.getElementById('humidity');
+        const weatherEl = document.getElementById('weatherCondition');
+        const timeEl = document.getElementById('updateTime');
+
+        tempEl.textContent = '加载中...';
+        //humidityEl.textContent = '加载中...';
+        weatherEl.textContent = '加载中...';
+        
+        fetch('/api/location-weather')
+            .then(response => {
+                if (!response.ok) throw new Error('网络响应不正常');
+                return response.json();
+            })
+            .then(data => {
+                // 若IP定位未完成，使用后端默认定位
+                const locationEl = document.getElementById('locationInfo');
+                if (locationEl.textContent.includes('未获取') || 
+                    locationEl.textContent.includes('加载中') ||
+                    locationEl.textContent.includes('失败')) {
+                    locationEl.textContent = data.location || '未知城市';
+                }
+                tempEl.textContent = data.temperature ? `${data.temperature}°C` : '未知';
+                //humidityEl.textContent = data.humidity ? `${data.humidity}%` : '未知';
+                weatherEl.textContent = data.weatherCondition || '未知';
+                timeEl.textContent = new Date().toLocaleString();
+            })
+            .catch(error => {
+                tempEl.textContent = '获取失败';
+                //humidityEl.textContent = '获取失败';
+                weatherEl.textContent = '获取失败';
+                timeEl.textContent = '更新失败';
+                console.error('获取天气出错:', error);
+            });
+    }
+</script>
+</body>
+</html>

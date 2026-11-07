@@ -1,0 +1,771 @@
+#include <Arduino.h>
+#include <Servo.h>
+#include <U8g2lib.h>
+#include <Wire.h>
+#include <FS.h>
+#include <ESP8266WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <ESP8266HTTPClient.h>
+#include <NTPClient.h>
+#include <ArduinoJson.h>
+#include <WiFiUdp.h>
+#include <time.h>
+#include "image.cpp"
+
+// -------------------------- 定位相关定义 --------------------------
+const char *baiduApiUrl = "http://api.map.baidu.com/location/ip?ak="; // 百度IP定位API
+String baiduApiKey = "";       // 百度地图API密钥（从配置页获取）
+String latitude = "";          // 纬度（字符串格式）
+String longitude = "";         // 经度（字符串格式）
+String district = "";          // 区/县（如“海淀区”）
+String city = "";              // 城市（如“北京市”）
+String province = "";          // 省份（如“北京市”）
+
+// -------------------------- 新增：中英文映射函数（省份/城市→纯英文） --------------------------
+String getProvinceEn(String cnProvince) {
+  if (cnProvince == "广东省") return "Guangdong";
+  else if (cnProvince == "北京市") return "Beijing";
+  else if (cnProvince == "上海市") return "Shanghai";
+  else if (cnProvince == "江苏省") return "Jiangsu";
+  else if (cnProvince == "浙江省") return "Zhejiang";
+  else if (cnProvince == "山东省") return "Shandong";
+  else if (cnProvince == "河南省") return "Henan";
+  else if (cnProvince == "湖北省") return "Hubei";
+  else if (cnProvince == "湖南省") return "Hunan";
+  else if (cnProvince == "四川省") return "Sichuan";
+  else return cnProvince;
+}
+
+String getCityEn(String cnCity) {
+  if (cnCity == "广州市") return "Guangzhou";
+  else if (cnCity == "深圳市") return "Shenzhen";
+  else if (cnCity == "珠海市") return "Zhuhai";
+  else if (cnCity == "汕头市") return "Shantou";
+  else if (cnCity == "佛山市") return "Foshan";
+  else if (cnCity == "韶关市") return "Shaoguan";
+  else if (cnCity == "湛江市") return "Zhanjiang";
+  else if (cnCity == "肇庆市") return "Zhaoqing";
+  else if (cnCity == "江门市") return "Jiangmen";
+  else if (cnCity == "茂名市") return "Maoming";
+  else if (cnCity == "惠州市") return "Huizhou";
+  else if (cnCity == "梅州市") return "Meizhou";
+  else if (cnCity == "汕尾市") return "Shanwei";
+  else if (cnCity == "河源市") return "Heyuan";
+  else if (cnCity == "阳江市") return "Yangjiang";
+  else if (cnCity == "清远市") return "Qingyuan";
+  else if (cnCity == "东莞市") return "Dongguan";
+  else if (cnCity == "中山市") return "Zhongshan";
+  else if (cnCity == "潮州市") return "Chaozhou";
+  else if (cnCity == "揭阳市") return "Jieyang";
+  else if (cnCity == "云浮市") return "Yunfu";
+  else return cnCity; // 若存在未匹配的县级市，返回原中文（可按需补充）
+}
+
+// -------------------------- 硬件与状态定义 --------------------------
+#define LOCATION_STATE 9  // 定位状态标识
+#define BUTTON_PIN 2  // 按键1引脚（D4）
+#define BUTTON_PIN2 15 // 按键2引脚
+volatile bool buttonPressed = false;    // 按键1触发标志
+volatile bool buttonPressed2 = false;   // 按键2触发标志
+unsigned long lastPressTime = 0;        // 按键1消抖计时
+const unsigned long debounceDelay = 50; // 按键1消抖时间(ms)
+unsigned long lastPressTime2 = 0;       // 按键2消抖计时
+const unsigned long debounceDelay2 = 50;// 按键2消抖时间(ms)
+
+// 电池检测参数
+const float voltageDividerRatio = 8.4;  // 分压比
+const float minVoltage = 6.4;           // 电池最低电压（0%）
+const float maxVoltage = 8.4;           // 电池最高电压（100%）
+const int numSamples = 10;              // 采样次数
+float batteryVoltage = 0;               // 电池电压
+int batteryPercentage = 0;              // 电池百分比
+
+// 舵机定义
+Servo servo1, servo2, servo3, servo4;
+const int engine1 = 14;  // 舵机1引脚（D5）
+const int engine2 = 16;  // 舵机2引脚（D0）
+const int engine3 = 12;  // 舵机3引脚（D6）
+const int engine4 = 13;  // 舵机4引脚（D7）
+
+// OLED显示屏（128×64分辨率）
+U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, 5, 4); // SCL=D1, SDA=D2
+
+// WiFi与Web服务
+const char *apSsid = "RobotDog";       // 设备热点名称
+const char *apPassword = "";           // 热点无密码
+AsyncWebServer server(80);             // Web服务器端口80
+WiFiUDP ntpUDP;                        // NTP客户端UDP
+NTPClient timeClient(ntpUDP, "ntp1.aliyun.com", 8*3600, 60000); // 北京时间（+8h）
+
+// 天气相关定义
+const char *weatherAPI = "http://api.seniverse.com/v3/weather/now.json?key=";
+String weatherapi = "";        // 心知天气API密钥（从配置页获取）
+String temperature = "";       // 最高温度（字符串）
+String humidity = "";          // 湿度（字符串）
+String weather = "";           // 天气状况（如“晴”）
+String cityname = "";          // 城市名称（由定位赋值）
+
+// 状态标志
+bool initweather = false;      // 天气初始化完成标志
+bool initLocation = false;     // 定位初始化完成标志
+bool freestate = false;        // 自由模式标志
+int prevEmojiState = -1;       // 上一表情状态（用于清屏）
+int actionstate = 0;           // 舵机动作状态
+int emojiState = 0;            // OLED表情状态
+
+// 配置文件
+const char *ssidFile = "/ssid.json";   // 配置存储路径
+
+// -------------------------- 新增：统一未联网显示函数 --------------------------
+void displayNoNet() {
+    do {
+        u8g2.setFont(u8g2_font_ncenB08_tr);
+        u8g2.drawXBMP(0, 0, 64, 64, wifi); // 保留原wifi图标
+        u8g2.drawStr(64, 20, "IP:");
+        u8g2.drawStr(64, 40, "192.168.4.1");
+        u8g2.drawStr(64, 60, "Need NET");
+    } while (u8g2.nextPage());
+}
+
+// -------------------------- 按键中断处理 --------------------------
+void ICACHE_RAM_ATTR handleButtonPress() {
+    // 按键1消抖
+    unsigned long currentTime = millis();
+    if (currentTime - lastPressTime > debounceDelay) {
+        buttonPressed = true;
+        lastPressTime = currentTime;
+    }
+    // 按键2消抖
+    unsigned long currentTime2 = millis();
+    if (currentTime2 - lastPressTime2 > debounceDelay2) {
+        buttonPressed2 = true;
+        lastPressTime2 = currentTime2;
+    }
+}
+
+// -------------------------- 百度定位获取 --------------------------
+void fetchLocation() {
+    // 若已定位、未联网或无API密钥，直接返回
+    if (initLocation || WiFi.status() != WL_CONNECTED || baiduApiKey.isEmpty()) {
+        return;
+    }
+    WiFiClient client;
+    HTTPClient http;
+    String apiUrl = baiduApiUrl + baiduApiKey + "&coor=bd09ll"; // 百度经纬度坐标
+    if (http.begin(client, apiUrl)) {
+        int httpCode = http.GET();
+        if (httpCode > 0) {
+            String payload = http.getString();
+            Serial.println("定位数据: " + payload);
+            DynamicJsonDocument doc(2048);
+            DeserializationError error = deserializeJson(doc, payload);
+            if (!error) {
+                int status = doc["status"];
+                if (status == 0) { // 百度API返回0表示成功
+                    JsonObject content = doc["content"];
+                    JsonObject point = content["point"];
+                    longitude = point["x"].as<String>(); // 经度
+                    latitude = point["y"].as<String>();  // 纬度
+                    JsonObject addressDetail = content["address_detail"];
+                    province = addressDetail["province"].as<String>();
+                    city = addressDetail["city"].as<String>();
+                    district = addressDetail["district"].as<String>();
+                    cityname = city; // 赋值给天气查询用的城市名
+                    initLocation = true;
+                    Serial.println("定位成功: " + province + city + district);
+                    Serial.println("经纬度: " + latitude + "," + longitude);
+                } else {
+                    Serial.println("定位失败，错误码: " + String(status));
+                }
+            } else {
+                Serial.println("定位JSON解析失败: " + String(error.c_str()));
+            }
+        } else {
+            Serial.println("定位请求失败，状态码: " + String(httpCode));
+        }
+        http.end(); // 关闭连接
+    }
+}
+
+// -------------------------- 心知天气获取（保留全部信息+新增城市名） --------------------------
+void fetchWeather() {
+    // 未联网时显示统一样式
+    if (WiFi.status() != WL_CONNECTED) {
+        displayNoNet();
+        return;
+    }
+    if (!initLocation) {
+        do {
+            u8g2.setFont(u8g2_font_ncenB08_tr);
+            u8g2.drawStr(0, 32, "获取位置中...");
+        } while (u8g2.nextPage());
+        return;
+    }
+    if (!initweather && WiFi.status() == WL_CONNECTED && !cityname.isEmpty()) {
+        WiFiClient client;
+        HTTPClient http;
+        String apiUrl = weatherAPI + weatherapi + "&location=" + cityname + 
+                       "&language=zh-Hans&unit=c";
+        if (http.begin(client, apiUrl)) {
+            int httpCode = http.GET();
+            if (httpCode > 0) {
+                String payload = http.getString();
+                DynamicJsonDocument doc(2048);
+                DeserializationError error = deserializeJson(doc, payload);
+                if (!error) {
+                    // 修正为当前温度
+                    temperature = doc["results"][0]["now"]["temperature"].as<String>();
+                    //humidity = doc["results"][0]["now"]["humidity"].as<String>();
+                    weather = doc["results"][0]["now"]["text"].as<String>();
+                    initweather = true;
+                } 
+            }
+            http.end();
+        }
+    }
+    // OLED显示部分保持不变
+    do {
+        u8g2.setFont(u8g2_font_ncenB08_tr);
+        if (weather.indexOf("雨") != -1) u8g2.drawXBMP(0, 0, 64, 64, rain);
+        else if (weather == "晴") u8g2.drawXBMP(0, 0, 64, 64, sun);
+        else u8g2.drawXBMP(0, 0, 64, 64, cloud);
+        
+        // 新代码显示逻辑
+        u8g2.drawStr(64, 20, "Temp");                       // 温度标签
+        u8g2.drawStr(64, 30, (temperature + " C").c_str()); // 温度值
+        //u8g2.drawStr(64, 50, "Humidity");                   // 湿度标签
+        //u8g2.drawStr(64, 60, (humidity + " %").c_str());    // 湿度值
+    } while (u8g2.nextPage());
+}
+
+// -------------------------- Web服务与路由配置 --------------------------
+void handleWiFiConfig() {
+    // 移除前端定位数据接收接口，仅保留IP定位
+    
+    // 定位/天气预览API（供上位机调用）
+    server.on("/api/location-weather", HTTP_GET, [](AsyncWebServerRequest *request) {
+        DynamicJsonDocument doc(1024);
+    
+        // 定位数据
+        if (initLocation) {
+            doc["location"] = province + city + district;
+            doc["latitude"] = latitude.substring(0, 6);  // 截取前6位
+            doc["longitude"] = longitude.substring(0, 6);
+        } else {
+            doc["location"] = "定位未完成";
+            doc["latitude"] = "未知";
+            doc["longitude"] = "未知";
+        }
+        
+        // 天气数据
+        if (initweather) {
+            doc["temperature"] = temperature;
+            //doc["humidity"] = humidity;
+            doc["weatherCondition"] = weather;
+        } else {
+            doc["temperature"] = "未知";
+            //doc["humidity"] = "未知";
+            doc["weatherCondition"] = "天气未获取";
+        }
+        
+        // 电池数据
+        doc["batteryVoltage"] = String(batteryVoltage, 1);
+        doc["batteryPercentage"] = batteryPercentage;
+        
+        // 返回JSON（无需额外编码，JSON默认UTF-8）
+        String response;
+        serializeJson(doc, response);
+        request->send(200, "application/json", response);
+    });
+    
+    // 表情状态控制接口 - 补充定位状态
+    server.on("/location", HTTP_GET, [](AsyncWebServerRequest *request) { 
+        emojiState = LOCATION_STATE; 
+        request->send(200, "text/plain; charset=UTF-8", "定位页"); 
+    });
+    
+    // 舵机控制接口（前端按钮调用）- 补充UTF-8编码
+    server.on("/front", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 1;
+        request->send(200, "text/plain; charset=UTF-8", "前进");
+    });
+    server.on("/back", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 4;
+        request->send(200, "text/plain; charset=UTF-8", "后退");
+    });
+    server.on("/left", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 2;
+        request->send(200, "text/plain; charset=UTF-8", "左转");
+    });
+    server.on("/right", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 3;
+        request->send(200, "text/plain; charset=UTF-8", "右转");
+    });
+    server.on("/toplefthand", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 5;
+        request->send(200, "text/plain; charset=UTF-8", "左上肢体");
+    });
+    server.on("/toprighthand", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 6;
+        request->send(200, "text/plain; charset=UTF-8", "右上肢体");
+    });
+    server.on("/sitdown", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 8;
+        request->send(200, "text/plain; charset=UTF-8", "坐下");
+    });
+    server.on("/lie", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 7;
+        request->send(200, "text/plain; charset=UTF-8", "躺下");
+    });
+    server.on("/sleep", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 10;
+        request->send(200, "text/plain; charset=UTF-8", "休眠");
+    });
+    server.on("/free", HTTP_GET, [](AsyncWebServerRequest *request) {
+        freestate = true;
+        request->send(200, "text/plain; charset=UTF-8", "自由模式开启");
+    });
+    server.on("/offfree", HTTP_GET, [](AsyncWebServerRequest *request) {
+        freestate = false;
+        request->send(200, "text/plain; charset=UTF-8", "自由模式关闭");
+    });
+    
+    // 表情状态控制接口 - 补充UTF-8编码
+    server.on("/histate", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 0; request->send(200, "text/plain; charset=UTF-8", "开心"); });
+    server.on("/angrystate", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 1; request->send(200, "text/plain; charset=UTF-8", "生气"); });
+    server.on("/errorstate", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 2; request->send(200, "text/plain; charset=UTF-8", "错误"); });
+    server.on("/dowhatstate", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 3; request->send(200, "text/plain; charset=UTF-8", "疑惑"); });
+    server.on("/lovestate", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 4; request->send(200, "text/plain; charset=UTF-8", "喜爱"); });
+    server.on("/sickstate", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 5; request->send(200, "text/plain; charset=UTF-8", "不适"); });
+    server.on("/yunstate", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 6; request->send(200, "text/plain; charset=UTF-8", "晕"); });
+    server.on("/weather", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 7; request->send(200, "text/plain; charset=UTF-8", "天气页"); });
+    server.on("/time", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 8; request->send(200, "text/plain; charset=UTF-8", "时间页"); });
+    server.on("/edastate", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 9; request->send(200, "text/plain; charset=UTF-8", "EDA状态"); });
+    
+    // 电池状态接口（无中文，无需修改）
+    server.on("/batteryVoltage", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/plain", String(batteryVoltage, 1));
+    });
+    server.on("/batteryPercentage", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/plain", String(batteryPercentage));
+    });
+    
+    // 配置保存接口（核心修正：加UTF-8编码）
+    server.on("/connect", HTTP_POST, [](AsyncWebServerRequest *request) {
+        // 获取配置参数（仅必要项：WiFi、天气API、百度API）
+        String ssid = request->getParam("ssid", true)->value();
+        String pass = request->getParam("pass", true)->value();
+        String api = request->getParam("api", true)->value();
+        String baiduApi = request->getParam("baiduMapApi", true)->value();
+        
+        // 保存配置到JSON文件
+        DynamicJsonDocument doc(1024);
+        doc["ssid"] = ssid;
+        doc["pass"] = pass;
+        doc["api"] = api;
+        doc["baiduapi"] = baiduApi;
+        fs::File file = SPIFFS.open(ssidFile, "w");
+        if (file) {
+            serializeJson(doc, file);
+            file.close();
+        }
+        
+        // 更新全局变量
+        weatherapi = api;
+        baiduApiKey = baiduApi;
+        
+        // 连接WiFi
+        WiFi.begin(ssid.c_str(), pass.c_str());
+        
+        // 修正：返回HTML时指定UTF-8编码
+        request->send(200, "text/html; charset=UTF-8", 
+            "<h1>配置已保存！请返回主页面</h1>");
+    });
+    
+    // 页面路由（加载HTML文件，无中文文本，无需修改）
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (SPIFFS.exists("/index.html")) {
+            request->send(SPIFFS, "/index.html", "text/html");
+        } else {
+            request->send(404, "text/plain; charset=UTF-8", "主页未找到");
+        }
+    });
+    server.on("/control.html", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (SPIFFS.exists("/control.html")) {
+            request->send(SPIFFS, "/control.html", "text/html");
+        } else {
+            request->send(404, "text/plain; charset=UTF-8", "控制页未找到");
+        }
+    });
+    server.on("/setting.html", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (SPIFFS.exists("/setting.html")) {
+            request->send(SPIFFS, "/setting.html", "text/html");
+        } else {
+            request->send(404, "text/plain; charset=UTF-8", "配置页未找到");
+        }
+    });
+    
+    server.begin(); // 启动Web服务器
+}
+
+// -------------------------- 加载配置文件 --------------------------
+void loadWiFiConfig() {
+    if (SPIFFS.begin()) {
+        if (SPIFFS.exists(ssidFile)) {
+            fs::File file = SPIFFS.open(ssidFile, "r");
+            if (file) {
+                DynamicJsonDocument doc(1024);
+                DeserializationError error = deserializeJson(doc, file);
+                if (!error) {
+                    // 读取配置（无city参数，避免冗余）
+                    String ssid = doc["ssid"].as<String>();
+                    String pass = doc["pass"].as<String>();
+                    weatherapi = doc["api"].as<String>();
+                    baiduApiKey = doc["baiduapi"].as<String>();
+                    
+                    // 连接WiFi
+                    WiFi.begin(ssid.c_str(), pass.c_str());
+                    unsigned long start = millis();
+                    while (WiFi.status() != WL_CONNECTED && millis() - start < 5000) {
+                        delay(500);
+                    }
+                    if (WiFi.status() == WL_CONNECTED) {
+                        Serial.println("WiFi已连接");
+                        timeClient.begin(); // 启动NTP
+                    } else {
+                        Serial.println("WiFi连接失败，启动配置页");
+                    }
+                }
+                file.close();
+            }
+        }
+    }
+}
+
+// -------------------------- 舵机动作函数 --------------------------
+void front() { // 前进
+    servo2.write(140); servo3.write(40); delay(100);
+    servo1.write(40); servo4.write(140); delay(100);
+    servo2.write(90); servo3.write(90); delay(100);
+    servo1.write(90); servo4.write(90); delay(100);
+    servo1.write(140); servo4.write(40); delay(100);
+    servo2.write(40); servo3.write(140); delay(100);
+    servo1.write(90); servo4.write(90); delay(100);
+    servo2.write(90); servo3.write(90);
+}
+
+void back() { // 后退
+    servo3.write(140); servo2.write(40); delay(100);
+    servo4.write(40); servo1.write(140); delay(100);
+    servo3.write(90); servo2.write(90); delay(100);
+    servo4.write(90); servo1.write(90); delay(100);
+    servo4.write(140); servo1.write(40); delay(100);
+    servo3.write(40); servo2.write(140); delay(100);
+    servo4.write(90); servo1.write(90); delay(100);
+    servo3.write(90); servo2.write(90);
+}
+
+void left() { // 左转
+    for (int i=0; i<3; i++) {
+        servo1.write(80); servo4.write(80); delay(100);
+        servo3.write(120); servo2.write(120); delay(100);
+        servo1.write(40); servo4.write(40); delay(100);
+        servo3.write(140); servo2.write(140); delay(100);
+        servo3.write(90); servo2.write(90); servo1.write(90); servo4.write(90); delay(100);
+        servo1.write(100); servo4.write(100); delay(100);
+        servo3.write(60); servo2.write(60); delay(100);
+        servo1.write(90); servo4.write(90); delay(100);
+        servo3.write(40); servo2.write(40); delay(100);
+        servo3.write(90); servo2.write(90);
+    }
+}
+
+void right() { // 右转
+    for (int i=0; i<3; i++) {
+        servo1.write(100); servo4.write(100); delay(100);
+        servo3.write(60); servo2.write(60); delay(100);
+        servo1.write(140); servo4.write(140); delay(100);
+        servo3.write(40); servo2.write(40); delay(100);
+        servo3.write(90); servo2.write(90); servo1.write(90); servo4.write(90); delay(100);
+        servo1.write(80); servo4.write(80); delay(100);
+        servo3.write(120); servo2.write(120); delay(100);
+        servo1.write(90); servo4.write(90); delay(100);
+        servo3.write(140); servo2.write(140); delay(100);
+        servo3.write(90); servo2.write(90);
+    }
+}
+
+void sitdown() { // 坐下
+    servo2.write(140); servo4.write(40); delay(3000);
+    servo2.write(90); servo4.write(90);
+}
+
+void lie() { // 躺下
+    servo1.write(180); servo3.write(0); servo2.write(0); servo4.write(180); delay(3000);
+    servo1.write(90); servo3.write(90); servo2.write(90); servo4.write(90);
+}
+
+void toplefthand() { // 左上肢体动作
+    for (int i=0; i<3; i++) {
+        servo3.write(0); delay(100);
+        servo3.write(30); delay(100);
+    }
+    servo3.write(90);
+}
+
+void toprighthand() { // 右上肢体动作
+    for (int i=0; i<3; i++) {
+        servo1.write(180); delay(100);
+        servo1.write(150); delay(100);
+    }
+    servo1.write(90);
+}
+
+void dosleep() { // 休眠姿势
+    servo1.write(0); servo3.write(180); servo2.write(180); servo4.write(0);
+}
+
+// -------------------------- 电池检测函数 --------------------------
+float getAverageAdcVoltage() { // 平均ADC电压
+    long total = 0;
+    for (int i=0; i<numSamples; i++) {
+        total += analogRead(A0);
+        delay(10);
+    }
+    return (total / (float)numSamples / 1023.0) * 1.0; // 参考电压1.0V
+}
+
+int mapBatteryPercentage(float voltage) { // 电压转百分比
+    if (voltage <= minVoltage) return 0;
+    if (voltage >= maxVoltage) return 100;
+    return (int)((voltage - minVoltage) / (maxVoltage - minVoltage) * 100);
+}
+
+// -------------------------- 串口指令监听（已修复语音控制适配） --------------------------
+void serialListen() {
+    if (Serial.available() > 0) {
+        String cmd = Serial.readStringUntil('\n');
+        cmd.trim();
+        Serial.println("收到指令: " + cmd);
+        
+        // 动作控制指令（原有+新增自由模式）
+        if (cmd == "front") front();
+        else if (cmd == "back") back();
+        else if (cmd == "left") left();
+        else if (cmd == "right") right();
+        else if (cmd == "sitdown") sitdown();
+        else if (cmd == "lie") lie();
+        else if (cmd == "toplefthand") toplefthand();
+        else if (cmd == "toprighthand") toprighthand();
+        else if (cmd == "dosleep") dosleep();
+        else if (cmd == "free") freestate = true;  // 语音"自由模式开"对应指令
+        else if (cmd == "offfree") freestate = false; // 语音"自由模式关"对应指令
+        
+        // 表情/功能页控制指令（语音拼音指令映射）
+        else if (cmd == "kaixin") emojiState = 0;    // 开心 → 原histate
+        else if (cmd == "shengqi") emojiState = 1;   // 生气 → 原angrystate
+        else if (cmd == "cuowu") emojiState = 2;     // 错误 → 原errorstate
+        else if (cmd == "haoqi") emojiState = 3;     // 好奇 → 原dowhatstate
+        else if (cmd == "xihuan") emojiState = 4;    // 喜欢 → 原lovestate
+        else if (cmd == "nanshou") emojiState = 5;   // 难受 → 原sickstate
+        else if (cmd == "yun") emojiState = 6;       // 晕 → 原yunstate
+        else if (cmd == "tianqi") emojiState = 7;    // 天气 → 原weather
+        else if (cmd == "shijian") emojiState = 8;   // 时间 → 原time
+        else if (cmd == "dingwei") emojiState = 9;   // 定位 → 原LOCATION_STATE
+        else if (cmd == "edastate") emojiState = 9;  // 保留原有EDA状态指令（如需）
+        
+        // 未知指令提示（可选，方便调试）
+        else Serial.println("未知指令，忽略执行");
+    }
+}
+
+// -------------------------- 初始化函数 --------------------------
+void setup() {
+    // 初始化OLED
+    u8g2.begin();
+    u8g2.setDisplayRotation(U8G2_R2); // 旋转屏幕（根据实际布局调整）
+    
+    // 初始化按键中断
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonPress, FALLING);
+    pinMode(BUTTON_PIN2, INPUT);
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN2), handleButtonPress, RISING);
+    
+    // 初始化SPIFFS文件系统
+    SPIFFS.begin();
+    
+    // 初始化舵机
+    servo1.attach(engine1, 500, 2500);
+    servo2.attach(engine2, 500, 2500);
+    servo3.attach(engine3, 500, 2500);
+    servo4.attach(engine4, 500, 2500);
+    // 舵机归中
+    servo1.write(90);
+    servo2.write(90);
+    servo3.write(90);
+    servo4.write(90);
+    
+    // 初始化串口
+    Serial.begin(115200);
+    
+    // 启动AP热点
+    WiFi.softAP(apSsid, apPassword);
+    Serial.println("AP热点启动: " + String(apSsid));
+    Serial.println("AP地址: " + WiFi.softAPIP().toString());
+    
+    // 加载配置并启动Web服务
+    loadWiFiConfig();
+    handleWiFiConfig();
+    
+    // 初始化显示AP信息
+    delay(5000);
+    u8g2.clearDisplay();
+    do {
+        u8g2.setFont(u8g2_font_ncenB08_tr);
+        u8g2.drawXBMP(0, 0, 64, 64, ipip); // IP图标
+        u8g2.drawStr(64, 10, "WIFI_AP");
+        u8g2.drawStr(64, 27, "RobotDog");
+        u8g2.drawStr(64, 43, "192.168.4.1");
+        u8g2.drawStr(64, 60, "WIFI CTRL");
+    } while (u8g2.nextPage());
+    delay(5000);
+    u8g2.clearDisplay();
+}
+
+// -------------------------- 主循环 --------------------------
+void loop() {
+    // 串口指令处理
+    if (Serial.available() > 0) {
+        serialListen();
+    }
+    
+    // 电池检测
+    float adcVoltage = getAverageAdcVoltage();
+    batteryVoltage = adcVoltage * voltageDividerRatio;
+    batteryPercentage = mapBatteryPercentage(batteryVoltage);
+    
+    // 按键动作处理
+    if (buttonPressed) {
+        buttonPressed = false;
+        front(); // 按键1触发前进
+    }
+    if (buttonPressed2) {
+        buttonPressed2 = false;
+        back();  // 按键2触发后退
+    }
+    
+    // 联网状态下更新定位、天气、时间
+    if (WiFi.status() == WL_CONNECTED) {
+        fetchLocation();      // 获取定位
+        if (initLocation) {   // 定位成功后获取天气
+            fetchWeather();
+        }
+        timeClient.update();  // 更新NTP时间
+    }
+    
+    // 表情状态变化时清屏
+    if (emojiState != prevEmojiState) {
+        u8g2.clearDisplay();
+        prevEmojiState = emojiState;
+    }
+    
+    // 自由模式（随机动作）
+    if (freestate) {
+        delay(3000);
+        actionstate = random(0, 10); // 随机动作
+    }
+    
+    // 执行舵机动作
+    switch (actionstate) {
+        case 1: front(); break;
+        case 2: left(); break;
+        case 3: right(); break;
+        case 4: back(); break;
+        case 5: toplefthand(); break;
+        case 6: toprighthand(); break;
+        case 7: lie(); break;
+        case 8: sitdown(); break;
+        case 10: dosleep(); break;
+        case 9: emojiState = random(0,7); break; // 随机表情
+        default: break;
+    }
+    actionstate = 0; // 动作执行后复位
+    
+    // OLED表情显示
+    switch (emojiState) {
+        case 0: do { u8g2.drawXBMP(0,0,128,64,hi); } while(u8g2.nextPage()); break;
+        case 1: do { u8g2.drawXBMP(0,0,128,64,angry); } while(u8g2.nextPage()); break;
+        case 2: do { u8g2.drawXBMP(0,0,128,64,error); } while(u8g2.nextPage()); break;
+        case 3: do { u8g2.drawXBMP(0,0,128,64,dowhat); } while(u8g2.nextPage()); break;
+        case 4: do { u8g2.drawXBMP(0,0,128,64,love); } while(u8g2.nextPage()); break;
+        case 5: do { u8g2.drawXBMP(0,0,128,64,sick); } while(u8g2.nextPage()); break;
+        case 6: do { u8g2.drawXBMP(0,0,128,64,yun); } while(u8g2.nextPage()); break;
+        case 7: fetchWeather(); break;
+        case 8:  // 时间+年月日+星期页
+            if (WiFi.status() != WL_CONNECTED) {
+                // 未联网时显示统一样式
+                displayNoNet();
+            } else {
+                timeClient.update(); // 更新NTP时间
+                time_t epochTime = timeClient.getEpochTime(); // 获取Unix时间戳
+                struct tm *timeInfo = localtime(&epochTime);  // 转换为本地时间结构体
+                do {
+                    u8g2.setFont(u8g2_font_ncenB08_tr);
+                    u8g2.drawXBMP(0,0,64,64,timeimage); // 时间图标
+                    // 1. 显示时间（时:分:秒，补0对齐）
+                    int h = timeInfo->tm_hour;
+                    int m = timeInfo->tm_min;
+                    int s = timeInfo->tm_sec;
+                    String timeStr = String(h) + ":" + (m<10?"0":"") + String(m) + ":" + (s<10?"0":"") + String(s);
+                    //u8g2.drawStr(64,20,"TIME");
+                    u8g2.drawStr(64,20,timeStr.c_str());  //35
+                    // 2. 显示年月日（年-月-日，补0对齐）
+                    int year = timeInfo->tm_year + 1900;  // tm_year是从1900年开始的偏移量
+                    int month = timeInfo->tm_mon + 1;     // tm_mon是0-11，需+1
+                    int day = timeInfo->tm_mday;
+                    String dateStr = String(year) + "-" + (month<10?"0":"") + String(month) + "-" + (day<10?"0":"") + String(day);
+                    u8g2.drawStr(64,35,dateStr.c_str());  //50
+                    // 3. 显示星期（tm_wday是0-6，0=周日）
+                    String weekDays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+                    String weekStr = weekDays[timeInfo->tm_wday];
+                    u8g2.drawStr(64,50,weekStr.c_str());
+                } while(u8g2.nextPage());
+            }
+            break;
+        case LOCATION_STATE:  
+    if (WiFi.status() != WL_CONNECTED) {
+        // 原有未联网逻辑（保持不变）
+        displayNoNet();
+    } else if (!initLocation) {
+        // 原有定位中逻辑（保持不变，可改为英文）
+        do {
+            u8g2.setFont(u8g2_font_ncenB08_tr);
+            u8g2.drawStr(0, 32, "Getting location...");
+        } while (u8g2.nextPage());
+    } else {
+        // 新增：英文分行显示（pro、City、Lat、Lon，保留两位小数）
+        do {
+            u8g2.setFont(u8g2_font_ncenB08_tr);
+            
+            // 1. 省份（简化为Pro）
+            String provinceEn = "Pro: " + getProvinceEn(province);
+            u8g2.drawStr(0, 16, provinceEn.c_str());
+            
+            // 2. 城市
+            String cityEn = "City: " + getCityEn(city);
+            u8g2.drawStr(0, 32, cityEn.c_str());
+            
+            // 3. 纬度（Lat，两位小数）
+            float lat = latitude.toFloat();
+            String latStr = "Lat: " + String(lat, 2);
+            u8g2.drawStr(0, 48, latStr.c_str());
+            
+            // 4. 经度（Lon，两位小数）
+            float lon = longitude.toFloat();
+            String lonStr = "Lon: " + String(lon, 2);
+            u8g2.drawStr(0, 64, lonStr.c_str());
+        } while(u8g2.nextPage());
+    }
+    break;
+    }
+}

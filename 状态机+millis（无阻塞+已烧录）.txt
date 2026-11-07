@@ -1,0 +1,1137 @@
+#include <Arduino.h>
+#include <Servo.h>
+#include <U8g2lib.h>
+#include <Wire.h>
+#include <FS.h>
+#include <ESP8266WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <ESP8266HTTPClient.h>
+#include <NTPClient.h>
+#include <ArduinoJson.h>
+#include <WiFiUdp.h>
+#include <time.h>
+#include "image.cpp"
+
+// -------------------------- 定位相关定义 --------------------------
+const char *baiduApiUrl = "http://api.map.baidu.com/location/ip?ak=";
+String baiduApiKey = "";
+String latitude = "";
+String longitude = "";
+String district = "";
+String city = "";
+String province = "";
+
+// -------------------------- 中英文映射函数 --------------------------
+String getProvinceEn(String cnProvince) {
+  if (cnProvince == "广东省") return "Guangdong";
+  else if (cnProvince == "北京市") return "Beijing";
+  else if (cnProvince == "上海市") return "Shanghai";
+  else if (cnProvince == "江苏省") return "Jiangsu";
+  else if (cnProvince == "浙江省") return "Zhejiang";
+  else if (cnProvince == "山东省") return "Shandong";
+  else if (cnProvince == "河南省") return "Henan";
+  else if (cnProvince == "湖北省") return "Hubei";
+  else if (cnProvince == "湖南省") return "Hunan";
+  else if (cnProvince == "四川省") return "Sichuan";
+  else return cnProvince;
+}
+String getCityEn(String cnCity) {
+  if (cnCity == "广州市") return "Guangzhou";
+  else if (cnCity == "深圳市") return "Shenzhen";
+  else if (cnCity == "珠海市") return "Zhuhai";
+  else if (cnCity == "汕头市") return "Shantou";
+  else if (cnCity == "佛山市") return "Foshan";
+  else if (cnCity == "韶关市") return "Shaoguan";
+  else if (cnCity == "湛江市") return "Zhanjiang";
+  else if (cnCity == "肇庆市") return "Zhaoqing";
+  else if (cnCity == "江门市") return "Jiangmen";
+  else if (cnCity == "茂名市") return "Maoming";
+  else if (cnCity == "惠州市") return "Huizhou";
+  else if (cnCity == "梅州市") return "Meizhou";
+  else if (cnCity == "汕尾市") return "Shanwei";
+  else if (cnCity == "河源市") return "Heyuan";
+  else if (cnCity == "阳江市") return "Yangjiang";
+  else if (cnCity == "清远市") return "Qingyuan";
+  else if (cnCity == "东莞市") return "Dongguan";
+  else if (cnCity == "中山市") return "Zhongshan";
+  else if (cnCity == "潮州市") return "Chaozhou";
+  else if (cnCity == "揭阳市") return "Jieyang";
+  else if (cnCity == "云浮市") return "Yunfu";
+  else return cnCity;
+}
+
+// -------------------------- 硬件与状态定义 --------------------------
+#define LOCATION_STATE 9
+#define BUTTON_PIN 2
+#define BUTTON_PIN2 15
+volatile bool buttonPressed = false;
+volatile bool buttonPressed2 = false;
+unsigned long lastPressTime = 0;
+const unsigned long debounceDelay = 50;
+unsigned long lastPressTime2 = 0;
+const unsigned long debounceDelay2 = 50;
+
+// 电池检测参数
+const float voltageDividerRatio = 8.4;
+const float minVoltage = 6.4;
+const float maxVoltage = 8.4;
+const int numSamples = 10;
+float batteryVoltage = 0;
+int batteryPercentage = 0;
+
+// 舵机定义
+Servo servo1, servo2, servo3, servo4;
+const int engine1 = 14; // D5
+const int engine2 = 16; // D0
+const int engine3 = 12; // D6
+const int engine4 = 13; // D7
+
+// OLED显示屏
+U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, 5, 4); // SCL=D1, SDA=D2
+
+// WiFi与Web服务
+const char *apSsid = "RobotDog";
+const char *apPassword = "";
+AsyncWebServer server(80);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "ntp1.aliyun.com", 8*3600, 60000);
+
+// 天气相关定义
+const char *weatherAPI = "http://api.seniverse.com/v3/weather/now.json?key=";
+String weatherapi = "";
+String temperature = "";
+String humidity = "";
+String weather = "";
+String cityname = "";
+
+// 状态标志
+bool initweather = false;
+bool initLocation = false;
+bool freestate = false;
+int prevEmojiState = -1;
+int actionstate = 0; // 0:无动作 1:前进 2:左转 3:右转 4:后退 5:左上肢体 6:右上肢体 7:躺下 8:坐下 10:休眠
+int emojiState = 0;
+
+// 配置文件
+const char *ssidFile = "/ssid.json";
+
+// -------------------------- 非阻塞动作状态机（核心：保留原结构体，修复步骤参数） --------------------------
+// 前进状态机：步骤与原阻塞函数front()完全匹配，确保角度正确
+struct FrontActionState {
+    int currentStep = 0;          // 当前步骤（0-7，共8步）
+    unsigned long stepStartTime = 0; // 步骤开始时间（millis()记录）
+    // steps数组：{servo1角度, servo2角度, servo3角度, servo4角度, 步骤延时(ms)}
+    const int steps[8][5] = {
+        {90, 140, 40, 90, 100},  // 原front()第1步：servo2=140, servo3=40
+        {40, 140, 40, 140, 100},  // 原front()第2步：servo1=40, servo4=140
+        {40, 90, 90, 140, 100},   // 原front()第3步：servo2=90, servo3=90
+        {90, 90, 90, 140, 100},   // 原front()第4步：servo1=90, servo4=90
+        {90, 90, 90, 40, 100},    // 原front()第5步：servo1=140, servo4=40（此处servo1=90为过渡，下一步才到140）
+        {140, 90, 90, 40, 100},  // 原front()第5步实际角度：servo1=140, servo4=40
+        {140, 40, 140, 40, 100},  // 原front()第6步：servo2=40, servo3=140
+        {90, 90, 90, 90, 100}    // 原front()第7-8步：归中
+    };
+} frontAction;
+
+// 后退状态机：与原阻塞函数back()角度完全匹配
+struct BackActionState {
+    int currentStep = 0;
+    unsigned long stepStartTime = 0;
+    const int steps[8][5] = {
+        {90, 40, 140, 90, 100},  // 原back()第1步：servo3=140, servo2=40
+        {140, 40, 140, 40, 100}, // 原back()第2步：servo4=40, servo1=140
+        {140, 90, 90, 40, 100}, // 原back()第3步：servo3=90, servo2=90
+        {90, 90, 90, 90, 100},   // 原back()第4步：servo4=90, servo1=90
+        {90, 90, 90, 140, 100},  // 原back()第5步：servo4=140, servo1=40（过渡步）
+        {40, 90, 90, 140, 100},  // 原back()第5步实际角度：servo4=140, servo1=40
+        {40, 140, 40, 140, 100},  // 原back()第6步：servo3=40, servo2=140
+        {90, 90, 90, 90, 100}    // 原back()第7-8步：归中
+    };
+} backAction;
+
+// 左转状态机：展开原3轮循环为30步，角度与原left()一致
+struct LeftActionState {
+    int currentStep = 0;
+    unsigned long stepStartTime = 0;
+    const int steps[30][5] = {
+        // 第1轮循环
+        {80, 90, 90, 80, 100},  // 原left()：servo1=80, servo4=80
+        {80, 120, 120, 80, 100}, // 原left()：servo3=120, servo2=120
+        {40, 120, 120, 40, 100}, // 原left()：servo1=40, servo4=40
+        {40, 140, 140, 40, 100}, // 原left()：servo3=140, servo2=140
+        {90, 90, 90, 90, 100},   // 原left()：归中
+        {100, 90, 90, 100, 100}, // 原left()：servo1=100, servo4=100
+        {100, 60, 60, 100, 100},  // 原left()：servo3=60, servo2=60
+        {90, 60, 60, 90, 100},   // 原left()：servo1=90, servo4=90
+        {90, 40, 40, 90, 100},   // 原left()：servo3=40, servo2=40
+        {90, 90, 90, 90, 100},   // 原left()：归中
+        // 第2轮循环（重复第1轮，与原left()的3次循环一致）
+        {80, 90, 90, 80, 100},
+        {80, 120, 120, 80, 100},
+        {40, 120, 120, 40, 100},
+        {40, 140, 140, 40, 100},
+        {90, 90, 90, 90, 100},
+        {100, 90, 90, 100, 100},
+        {100, 60, 60, 100, 100},
+        {90, 60, 60, 90, 100},
+        {90, 40, 40, 90, 100},
+        {90, 90, 90, 90, 100},
+        // 第3轮循环
+        {80, 90, 90, 80, 100},
+        {80, 120, 120, 80, 100},
+        {40, 120, 120, 40, 100},
+        {40, 140, 140, 40, 100},
+        {90, 90, 90, 90, 100},
+        {100, 90, 90, 100, 100},
+        {100, 60, 60, 100, 100},
+        {90, 60, 60, 90, 100},
+        {90, 40, 40, 90, 100},
+        {90, 90, 90, 90, 100}
+    };
+} leftAction;
+
+// 右转状态机：与原right()角度完全匹配
+struct RightActionState {
+    int currentStep = 0;
+    unsigned long stepStartTime = 0;
+    const int steps[30][5] = {
+        // 第1轮循环
+        {100, 90, 90, 100, 100}, // 原right()：servo1=100, servo4=100
+        {100, 60, 60, 100, 100},  // 原right()：servo3=60, servo2=60
+        {140, 60, 60, 140, 100}, // 原right()：servo1=140, servo4=140
+        {140, 40, 40, 140, 100}, // 原right()：servo3=40, servo2=40
+        {90, 90, 90, 90, 100},   // 原right()：归中
+        {80, 90, 90, 80, 100},   // 原right()：servo1=80, servo4=80
+        {80, 120, 120, 80, 100}, // 原right()：servo3=120, servo2=120
+        {90, 120, 120, 90, 100}, // 原right()：servo1=90, servo4=90
+        {90, 140, 140, 90, 100}, // 原right()：servo3=140, servo2=140
+        {90, 90, 90, 90, 100},   // 原right()：归中
+        // 第2轮循环
+        {100, 90, 90, 100, 100},
+        {100, 60, 60, 100, 100},
+        {140, 60, 60, 140, 100},
+        {140, 40, 40, 140, 100},
+        {90, 90, 90, 90, 100},
+        {80, 90, 90, 80, 100},
+        {80, 120, 120, 80, 100},
+        {90, 120, 120, 90, 100},
+        {90, 140, 140, 90, 100},
+        {90, 90, 90, 90, 100},
+        // 第3轮循环
+        {100, 90, 90, 100, 100},
+        {100, 60, 60, 100, 100},
+        {140, 60, 60, 140, 100},
+        {140, 40, 40, 140, 100},
+        {90, 90, 90, 90, 100},
+        {80, 90, 90, 80, 100},
+        {80, 120, 120, 80, 100},
+        {90, 120, 120, 90, 100},
+        {90, 140, 140, 90, 100},
+        {90, 90, 90, 90, 100}
+    };
+} rightAction;
+
+// 坐下状态机：与原sitdown()一致
+struct SitdownActionState {
+    int currentStep = 0;
+    unsigned long stepStartTime = 0;
+    const int steps[2][5] = {
+        {90, 140, 90, 40, 3000},  // 原sitdown()：servo2=140, servo4=40，延时3000ms
+        {90, 90, 90, 90, 100}     // 归中
+    };
+} sitdownAction;
+
+// 躺下状态机：与原lie()一致
+struct LieActionState {
+    int currentStep = 0;
+    unsigned long stepStartTime = 0;
+    const int steps[2][5] = {
+        {180, 0, 0, 180, 3000},   // 原lie()：servo1=180, servo3=0, servo2=0, servo4=180，延时3000ms
+        {90, 90, 90, 90, 100}    // 归中
+    };
+} lieAction;
+
+// 左上肢体状态机：与原toplefthand()一致
+struct TopLeftHandActionState {
+    int currentStep = 0;
+    unsigned long stepStartTime = 0;
+    const int steps[6][5] = {
+        {90, 90, 0, 90, 100},    // 原toplefthand()：servo3=0
+        {90, 90, 30, 90, 100},   // 原toplefthand()：servo3=30
+        {90, 90, 0, 90, 100},    // 重复3次
+        {90, 90, 30, 90, 100},
+        {90, 90, 0, 90, 100},
+        {90, 90, 90, 90, 100}    // 归中
+    };
+} topLeftHandAction;
+
+// 右上肢体状态机：与原toprighthand()一致
+struct TopRightHandActionState {
+    int currentStep = 0;
+    unsigned long stepStartTime = 0;
+    const int steps[6][5] = {
+        {180, 90, 90, 90, 100},  // 原toprighthand()：servo1=180
+        {150, 90, 90, 90, 100},  // 原toprighthand()：servo1=150
+        {180, 90, 90, 90, 100},  // 重复3次
+        {150, 90, 90, 90, 100},
+        {180, 90, 90, 90, 100},
+        {90, 90, 90, 90, 100}     // 归中
+    };
+} topRightHandAction;
+
+// 休眠状态机：与原dosleep()一致
+struct DoSleepActionState {
+    int currentStep = 0;
+    unsigned long stepStartTime = 0;
+    const int steps[1][5] = {
+        {0, 180, 180, 0, 100}     // 原dosleep()：servo1=0, servo3=180, servo2=180, servo4=0
+    };
+} doSleepAction;
+
+// 自由模式非阻塞等待（millis()实现）
+unsigned long freeModeWaitStart = 0;
+const unsigned long freeModeWaitMs = 3000; // 自由模式动作间隔3秒
+
+// -------------------------- 统一未联网显示函数 --------------------------
+void displayNoNet() {
+    do {
+        u8g2.setFont(u8g2_font_ncenB08_tr);
+        u8g2.drawXBMP(0, 0, 64, 64, wifi);
+        u8g2.drawStr(64, 20, "IP:");
+        u8g2.drawStr(64, 40, "192.168.4.1");
+        u8g2.drawStr(64, 60, "Need NET");
+    } while (u8g2.nextPage());
+}
+
+// -------------------------- 按键中断处理 --------------------------
+void ICACHE_RAM_ATTR handleButtonPress() {
+    unsigned long currentTime = millis();
+    if (currentTime - lastPressTime > debounceDelay) {
+        buttonPressed = true;
+        lastPressTime = currentTime;
+    }
+    unsigned long currentTime2 = millis();
+    if (currentTime2 - lastPressTime2 > debounceDelay2) {
+        buttonPressed2 = true;
+        lastPressTime2 = currentTime2;
+    }
+}
+
+// -------------------------- 百度定位获取 --------------------------
+void fetchLocation() {
+    if (initLocation || WiFi.status() != WL_CONNECTED || baiduApiKey.isEmpty()) {
+        return;
+    }
+    WiFiClient client;
+    HTTPClient http;
+    String apiUrl = baiduApiUrl + baiduApiKey + "&coor=bd09ll";
+    if (http.begin(client, apiUrl)) {
+        int httpCode = http.GET();
+        if (httpCode > 0) {
+            String payload = http.getString();
+            Serial.println("定位数据: " + payload);
+            DynamicJsonDocument doc(2048);
+            DeserializationError error = deserializeJson(doc, payload);
+            if (!error) {
+                int status = doc["status"];
+                if (status == 0) {
+                    JsonObject content = doc["content"];
+                    JsonObject point = content["point"];
+                    longitude = point["x"].as<String>();
+                    latitude = point["y"].as<String>();
+                    JsonObject addressDetail = content["address_detail"];
+                    province = addressDetail["province"].as<String>();
+                    city = addressDetail["city"].as<String>();
+                    district = addressDetail["district"].as<String>();
+                    cityname = city;
+                    initLocation = true;
+                    Serial.println("定位成功: " + province + city + district);
+                    Serial.println("经纬度: " + latitude + "," + longitude);
+                } else {
+                    Serial.println("定位失败，错误码: " + String(status));
+                }
+            } else {
+                Serial.println("定位JSON解析失败: " + String(error.c_str()));
+            }
+        } else {
+            Serial.println("定位请求失败，状态码: " + String(httpCode));
+        }
+        http.end();
+    }
+}
+
+// -------------------------- 心知天气获取 --------------------------
+void fetchWeather() {
+    if (WiFi.status() != WL_CONNECTED) {
+        displayNoNet();
+        return;
+    }
+    if (!initLocation) {
+        do {
+            u8g2.setFont(u8g2_font_ncenB08_tr);
+            u8g2.drawStr(0, 32, "获取位置中...");
+        } while (u8g2.nextPage());
+        return;
+    }
+    if (!initweather && WiFi.status() == WL_CONNECTED && !cityname.isEmpty()) {
+        WiFiClient client;
+        HTTPClient http;
+        String apiUrl = weatherAPI + weatherapi + "&location=" + cityname + 
+                       "&language=zh-Hans&unit=c";
+        if (http.begin(client, apiUrl)) {
+            int httpCode = http.GET();
+            if (httpCode > 0) {
+                String payload = http.getString();
+                DynamicJsonDocument doc(2048);
+                DeserializationError error = deserializeJson(doc, payload);
+                if (!error) {
+                    temperature = doc["results"][0]["now"]["temperature"].as<String>();
+                    weather = doc["results"][0]["now"]["text"].as<String>();
+                    initweather = true;
+                } 
+            }
+            http.end();
+        }
+    }
+    do {
+        u8g2.setFont(u8g2_font_ncenB08_tr);
+        if (weather.indexOf("雨") != -1) u8g2.drawXBMP(0, 0, 64, 64, rain);
+        else if (weather == "晴") u8g2.drawXBMP(0, 0, 64, 64, sun);
+        else u8g2.drawXBMP(0, 0, 64, 64, cloud);
+        u8g2.drawStr(64, 20, "Temp");
+        u8g2.drawStr(64, 30, (temperature + " C").c_str());
+    } while (u8g2.nextPage());
+}
+
+// -------------------------- Web服务与路由配置 --------------------------
+void handleWiFiConfig() {
+    // 定位/天气API
+    server.on("/api/location-weather", HTTP_GET, [](AsyncWebServerRequest *request) {
+        DynamicJsonDocument doc(1024);
+        if (initLocation) {
+            doc["location"] = province + city + district;
+            doc["latitude"] = latitude.substring(0, 6);
+            doc["longitude"] = longitude.substring(0, 6);
+        } else {
+            doc["location"] = "定位未完成";
+            doc["latitude"] = "未知";
+            doc["longitude"] = "未知";
+        }
+        if (initweather) {
+            doc["temperature"] = temperature;
+            doc["weatherCondition"] = weather;
+        } else {
+            doc["temperature"] = "未知";
+            doc["weatherCondition"] = "天气未获取";
+        }
+        doc["batteryVoltage"] = String(batteryVoltage, 1);
+        doc["batteryPercentage"] = batteryPercentage;
+        String response;
+        serializeJson(doc, response);
+        request->send(200, "application/json", response);
+    });
+
+    // 定位页控制
+    server.on("/location", HTTP_GET, [](AsyncWebServerRequest *request) { 
+        emojiState = LOCATION_STATE; 
+        request->send(200, "text/plain; charset=UTF-8", "定位页"); 
+    });
+
+    // 舵机控制接口（触发动作时重置状态机步骤）
+    server.on("/front", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 1;
+        // 修复1：重置前进状态机参数
+        frontAction.currentStep = 0;
+        frontAction.stepStartTime = 0;
+        request->send(200, "text/plain; charset=UTF-8", "前进");
+    });
+    server.on("/back", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 4;
+        // 修复2：重置后退状态机参数
+        backAction.currentStep = 0;
+        backAction.stepStartTime = 0;
+        request->send(200, "text/plain; charset=UTF-8", "后退");
+    });
+    server.on("/left", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 2;
+        // 修复3：重置左转状态机参数
+        leftAction.currentStep = 0;
+        leftAction.stepStartTime = 0;
+        request->send(200, "text/plain; charset=UTF-8", "左转");
+    });
+    server.on("/right", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 3;
+        // 修复4：重置右转状态机参数
+        rightAction.currentStep = 0;
+        rightAction.stepStartTime = 0;
+        request->send(200, "text/plain; charset=UTF-8", "右转");
+    });
+    server.on("/toplefthand", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 5;
+        // 修复5：重置左上肢体状态机参数
+        topLeftHandAction.currentStep = 0;
+        topLeftHandAction.stepStartTime = 0;
+        request->send(200, "text/plain; charset=UTF-8", "左上肢体");
+    });
+    server.on("/toprighthand", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 6;
+        // 修复6：重置右上肢体状态机参数
+        topRightHandAction.currentStep = 0;
+        topRightHandAction.stepStartTime = 0;
+        request->send(200, "text/plain; charset=UTF-8", "右上肢体");
+    });
+    server.on("/sitdown", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 8;
+        // 修复7：重置坐下状态机参数
+        sitdownAction.currentStep = 0;
+        sitdownAction.stepStartTime = 0;
+        request->send(200, "text/plain; charset=UTF-8", "坐下");
+    });
+    server.on("/lie", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 7;
+        // 修复8：重置躺下状态机参数
+        lieAction.currentStep = 0;
+        lieAction.stepStartTime = 0;
+        request->send(200, "text/plain; charset=UTF-8", "躺下");
+    });
+    server.on("/sleep", HTTP_GET, [](AsyncWebServerRequest *request) {
+        actionstate = 10;
+        // 修复9：重置休眠状态机参数
+        doSleepAction.currentStep = 0;
+        doSleepAction.stepStartTime = 0;
+        request->send(200, "text/plain; charset=UTF-8", "休眠");
+    });
+    server.on("/free", HTTP_GET, [](AsyncWebServerRequest *request) {
+        freestate = true;
+        freeModeWaitStart = millis();
+        request->send(200, "text/plain; charset=UTF-8", "自由模式开启");
+    });
+    server.on("/offfree", HTTP_GET, [](AsyncWebServerRequest *request) {
+        freestate = false;
+        request->send(200, "text/plain; charset=UTF-8", "自由模式关闭");
+    });
+
+    // 表情控制接口
+    server.on("/histate", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 0; request->send(200, "text/plain; charset=UTF-8", "开心"); });
+    server.on("/angrystate", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 1; request->send(200, "text/plain; charset=UTF-8", "生气"); });
+    server.on("/errorstate", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 2; request->send(200, "text/plain; charset=UTF-8", "错误"); });
+    server.on("/dowhatstate", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 3; request->send(200, "text/plain; charset=UTF-8", "疑惑"); });
+    server.on("/lovestate", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 4; request->send(200, "text/plain; charset=UTF-8", "喜爱"); });
+    server.on("/sickstate", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 5; request->send(200, "text/plain; charset=UTF-8", "不适"); });
+    server.on("/yunstate", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 6; request->send(200, "text/plain; charset=UTF-8", "晕"); });
+    server.on("/weather", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 7; request->send(200, "text/plain; charset=UTF-8", "天气页"); });
+    server.on("/time", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 8; request->send(200, "text/plain; charset=UTF-8", "时间页"); });
+    server.on("/edastate", HTTP_GET, [](AsyncWebServerRequest *request) { emojiState = 9; request->send(200, "text/plain; charset=UTF-8", "EDA状态"); });
+
+    // 电池状态接口
+    server.on("/batteryVoltage", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/plain", String(batteryVoltage, 1));
+    });
+    server.on("/batteryPercentage", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/plain", String(batteryPercentage));
+    });
+
+    // 配置保存接口
+    server.on("/connect", HTTP_POST, [](AsyncWebServerRequest *request) {
+        String ssid = request->getParam("ssid", true)->value();
+        String pass = request->getParam("pass", true)->value();
+        String api = request->getParam("api", true)->value();
+        String baiduApi = request->getParam("baiduMapApi", true)->value();
+        DynamicJsonDocument doc(1024);
+        doc["ssid"] = ssid;
+        doc["pass"] = pass;
+        doc["api"] = api;
+        doc["baiduapi"] = baiduApi;
+        fs::File file = SPIFFS.open(ssidFile, "w");
+        if (file) {
+            serializeJson(doc, file);
+            file.close();
+        }
+        weatherapi = api;
+        baiduApiKey = baiduApi;
+        WiFi.begin(ssid.c_str(), pass.c_str());
+        request->send(200, "text/html; charset=UTF-8", "<h1>配置已保存！请返回主页面</h1>");
+    });
+
+    // 1. 首页路由（/ 对应 index.html）
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (SPIFFS.exists("/index.html")) {
+        // 文件存在：发送SPIFFS中的index.html
+        request->send(SPIFFS, "/index.html", "text/html");
+    } else {
+        // 文件不存在：返回404错误（带中文提示需指定UTF-8编码）
+        request->send(404, "text/plain; charset=UTF-8", "404 - 首页文件（index.html）不存在");
+    }
+    });
+
+    // 2. 控制页路由（/control.html）
+    server.on("/control.html", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (SPIFFS.exists("/control.html")) {
+        request->send(SPIFFS, "/control.html", "text/html");
+    } else {
+        request->send(404, "text/plain; charset=UTF-8", "404 - 控制页文件（control.html）不存在");
+    }
+    });
+
+    // 3. 设置页路由（/setting.html）
+    server.on("/setting.html", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (SPIFFS.exists("/setting.html")) {
+        request->send(SPIFFS, "/setting.html", "text/html");
+    } else {
+        request->send(404, "text/plain; charset=UTF-8", "404 - 设置页文件（setting.html）不存在");
+    }
+    });
+
+    server.begin();
+}
+
+// -------------------------- 加载配置文件 --------------------------
+void loadWiFiConfig() {
+    if (SPIFFS.begin()) {
+        if (SPIFFS.exists(ssidFile)) {
+            fs::File file = SPIFFS.open(ssidFile, "r");
+            if (file) {
+                DynamicJsonDocument doc(1024);
+                DeserializationError error = deserializeJson(doc, file);
+                if (!error) {
+                    String ssid = doc["ssid"].as<String>();
+                    String pass = doc["pass"].as<String>();
+                    weatherapi = doc["api"].as<String>();
+                    baiduApiKey = doc["baiduapi"].as<String>();
+                    WiFi.begin(ssid.c_str(), pass.c_str());
+                    unsigned long start = millis();
+                    while (WiFi.status() != WL_CONNECTED && millis() - start < 5000) {
+                        delay(500);
+                    }
+                    if (WiFi.status() == WL_CONNECTED) {
+                        Serial.println("WiFi已连接");
+                        timeClient.begin();
+                    } else {
+                        Serial.println("WiFi连接失败，启动配置页");
+                    }
+                }
+                file.close();
+            }
+        }
+    }
+}
+
+// -------------------------- 非阻塞动作执行（状态机+millis()核心逻辑） --------------------------
+// 前进动作：状态机推进
+void frontNonBlock() {
+    // 1. 动作完成：重置状态
+    if (frontAction.currentStep >= sizeof(frontAction.steps)/sizeof(frontAction.steps[0])) {
+        frontAction.currentStep = 0;
+        frontAction.stepStartTime = 0;
+        actionstate = 0; // 动作结束，重置动作状态
+        return;
+    }
+
+    unsigned long currentTime = millis();
+    int currentStepIdx = frontAction.currentStep;
+    int stepDelay = frontAction.steps[currentStepIdx][4];
+
+    // 2. 首次进入该步骤：设置舵机角度+记录开始时间
+    if (frontAction.stepStartTime == 0) {
+        servo1.write(frontAction.steps[currentStepIdx][0]);
+        servo2.write(frontAction.steps[currentStepIdx][1]);
+        servo3.write(frontAction.steps[currentStepIdx][2]);
+        servo4.write(frontAction.steps[currentStepIdx][3]);
+        frontAction.stepStartTime = currentTime; // 用millis()记录开始时间，替代delay()
+        return;
+    }
+
+    // 3. 步骤延时到：推进到下一步
+    if (currentTime - frontAction.stepStartTime >= stepDelay) {
+        frontAction.currentStep++;
+        frontAction.stepStartTime = 0; // 重置时间，为下一步做准备
+    }
+}
+
+// 后退动作：同前进逻辑
+void backNonBlock() {
+    if (backAction.currentStep >= sizeof(backAction.steps)/sizeof(backAction.steps[0])) {
+        backAction.currentStep = 0;
+        backAction.stepStartTime = 0;
+        actionstate = 0;
+        return;
+    }
+
+    unsigned long currentTime = millis();
+    int currentStepIdx = backAction.currentStep;
+    int stepDelay = backAction.steps[currentStepIdx][4];
+
+    if (backAction.stepStartTime == 0) {
+        servo1.write(backAction.steps[currentStepIdx][0]);
+        servo2.write(backAction.steps[currentStepIdx][1]);
+        servo3.write(backAction.steps[currentStepIdx][2]);
+        servo4.write(backAction.steps[currentStepIdx][3]);
+        backAction.stepStartTime = currentTime;
+        return;
+    }
+
+    if (currentTime - backAction.stepStartTime >= stepDelay) {
+        backAction.currentStep++;
+        backAction.stepStartTime = 0;
+    }
+}
+
+// 左转动作：同前进逻辑
+void leftNonBlock() {
+    if (leftAction.currentStep >= sizeof(leftAction.steps)/sizeof(leftAction.steps[0])) {
+        leftAction.currentStep = 0;
+        leftAction.stepStartTime = 0;
+        actionstate = 0;
+        return;
+    }
+
+    unsigned long currentTime = millis();
+    int currentStepIdx = leftAction.currentStep;
+    int stepDelay = leftAction.steps[currentStepIdx][4];
+
+    if (leftAction.stepStartTime == 0) {
+        servo1.write(leftAction.steps[currentStepIdx][0]);
+        servo2.write(leftAction.steps[currentStepIdx][1]);
+        servo3.write(leftAction.steps[currentStepIdx][2]);
+        servo4.write(leftAction.steps[currentStepIdx][3]);
+        leftAction.stepStartTime = currentTime;
+        return;
+    }
+
+    if (currentTime - leftAction.stepStartTime >= stepDelay) {
+        leftAction.currentStep++;
+        leftAction.stepStartTime = 0;
+    }
+}
+
+// 右转动作：同前进逻辑
+void rightNonBlock() {
+    if (rightAction.currentStep >= sizeof(rightAction.steps)/sizeof(rightAction.steps[0])) {
+        rightAction.currentStep = 0;
+        rightAction.stepStartTime = 0;
+        actionstate = 0;
+        return;
+    }
+
+    unsigned long currentTime = millis();
+    int currentStepIdx = rightAction.currentStep;
+    int stepDelay = rightAction.steps[currentStepIdx][4];
+
+    if (rightAction.stepStartTime == 0) {
+        servo1.write(rightAction.steps[currentStepIdx][0]);
+        servo2.write(rightAction.steps[currentStepIdx][1]);
+        servo3.write(rightAction.steps[currentStepIdx][2]);
+        servo4.write(rightAction.steps[currentStepIdx][3]);
+        rightAction.stepStartTime = currentTime;
+        return;
+    }
+
+    if (currentTime - rightAction.stepStartTime >= stepDelay) {
+        rightAction.currentStep++;
+        rightAction.stepStartTime = 0;
+    }
+}
+
+// 坐下动作：同前进逻辑
+void sitdownNonBlock() {
+    if (sitdownAction.currentStep >= sizeof(sitdownAction.steps)/sizeof(sitdownAction.steps[0])) {
+        sitdownAction.currentStep = 0;
+        sitdownAction.stepStartTime = 0;
+        actionstate = 0;
+        return;
+    }
+
+    unsigned long currentTime = millis();
+    int currentStepIdx = sitdownAction.currentStep;
+    int stepDelay = sitdownAction.steps[currentStepIdx][4];
+
+    if (sitdownAction.stepStartTime == 0) {
+        servo1.write(sitdownAction.steps[currentStepIdx][0]);
+        servo2.write(sitdownAction.steps[currentStepIdx][1]);
+        servo3.write(sitdownAction.steps[currentStepIdx][2]);
+        servo4.write(sitdownAction.steps[currentStepIdx][3]);
+        sitdownAction.stepStartTime = currentTime;
+        return;
+    }
+
+    if (currentTime - sitdownAction.stepStartTime >= stepDelay) {
+        sitdownAction.currentStep++;
+        sitdownAction.stepStartTime = 0;
+    }
+}
+
+// 躺下动作：同前进逻辑
+void lieNonBlock() {
+    if (lieAction.currentStep >= sizeof(lieAction.steps)/sizeof(lieAction.steps[0])) {
+        lieAction.currentStep = 0;
+        lieAction.stepStartTime = 0;
+        actionstate = 0;
+        return;
+    }
+
+    unsigned long currentTime = millis();
+    int currentStepIdx = lieAction.currentStep;
+    int stepDelay = lieAction.steps[currentStepIdx][4];
+
+    if (lieAction.stepStartTime == 0) {
+        servo1.write(lieAction.steps[currentStepIdx][0]);
+        servo2.write(lieAction.steps[currentStepIdx][1]);
+        servo3.write(lieAction.steps[currentStepIdx][2]);
+        servo4.write(lieAction.steps[currentStepIdx][3]);
+        lieAction.stepStartTime = currentTime;
+        return;
+    }
+
+    if (currentTime - lieAction.stepStartTime >= stepDelay) {
+        lieAction.currentStep++;
+        lieAction.stepStartTime = 0;
+    }
+}
+
+// 左上肢体动作：同前进逻辑
+void topLeftHandNonBlock() {
+    if (topLeftHandAction.currentStep >= sizeof(topLeftHandAction.steps)/sizeof(topLeftHandAction.steps[0])) {
+        topLeftHandAction.currentStep = 0;
+        topLeftHandAction.stepStartTime = 0;
+        actionstate = 0;
+        return;
+    }
+
+    unsigned long currentTime = millis();
+    int currentStepIdx = topLeftHandAction.currentStep;
+    int stepDelay = topLeftHandAction.steps[currentStepIdx][4];
+
+    if (topLeftHandAction.stepStartTime == 0) {
+        servo1.write(topLeftHandAction.steps[currentStepIdx][0]);
+        servo2.write(topLeftHandAction.steps[currentStepIdx][1]);
+        servo3.write(topLeftHandAction.steps[currentStepIdx][2]);
+        servo4.write(topLeftHandAction.steps[currentStepIdx][3]);
+        topLeftHandAction.stepStartTime = currentTime;
+        return;
+    }
+
+    if (currentTime - topLeftHandAction.stepStartTime >= stepDelay) {
+        topLeftHandAction.currentStep++;
+        topLeftHandAction.stepStartTime = 0;
+    }
+}
+
+// 右上肢体动作：同前进逻辑
+void topRightHandNonBlock() {
+    if (topRightHandAction.currentStep >= sizeof(topRightHandAction.steps)/sizeof(topRightHandAction.steps[0])) {
+        topRightHandAction.currentStep = 0;
+        topRightHandAction.stepStartTime = 0;
+        actionstate = 0;
+        return;
+    }
+
+    unsigned long currentTime = millis();
+    int currentStepIdx = topRightHandAction.currentStep;
+    int stepDelay = topRightHandAction.steps[currentStepIdx][4];
+
+    if (topRightHandAction.stepStartTime == 0) {
+        servo1.write(topRightHandAction.steps[currentStepIdx][0]);
+        servo2.write(topRightHandAction.steps[currentStepIdx][1]);
+        servo3.write(topRightHandAction.steps[currentStepIdx][2]);
+        servo4.write(topRightHandAction.steps[currentStepIdx][3]);
+        topRightHandAction.stepStartTime = currentTime;
+        return;
+    }
+
+    if (currentTime - topRightHandAction.stepStartTime >= stepDelay) {
+        topRightHandAction.currentStep++;
+        topRightHandAction.stepStartTime = 0;
+    }
+}
+
+// 休眠动作：同前进逻辑
+void doSleepNonBlock() {
+    if (doSleepAction.currentStep >= sizeof(doSleepAction.steps)/sizeof(doSleepAction.steps[0])) {
+        doSleepAction.currentStep = 0;
+        doSleepAction.stepStartTime = 0;
+        actionstate = 0;
+        return;
+    }
+
+    unsigned long currentTime = millis();
+    int currentStepIdx = doSleepAction.currentStep;
+    int stepDelay = doSleepAction.steps[currentStepIdx][4];
+
+    if (doSleepAction.stepStartTime == 0) {
+        servo1.write(doSleepAction.steps[currentStepIdx][0]);
+        servo2.write(doSleepAction.steps[currentStepIdx][1]);
+        servo3.write(doSleepAction.steps[currentStepIdx][2]);
+        servo4.write(doSleepAction.steps[currentStepIdx][3]);
+        doSleepAction.stepStartTime = currentTime;
+        return;
+    }
+
+    if (currentTime - doSleepAction.stepStartTime >= stepDelay) {
+        doSleepAction.currentStep++;
+        doSleepAction.stepStartTime = 0;
+    }
+}
+
+// -------------------------- 电池检测函数 --------------------------
+float getAverageAdcVoltage() {
+    long total = 0;
+    for (int i=0; i<numSamples; i++) {
+        total += analogRead(A0);
+        delay(10); // 电池采样延时不影响非阻塞动作（仅10ms，且主循环仍在推进）
+    }
+    return (total / (float)numSamples / 1023.0) * 1.0;
+}
+int mapBatteryPercentage(float voltage) {
+    if (voltage <= minVoltage) return 0;
+    if (voltage >= maxVoltage) return 100;
+    return (int)((voltage - minVoltage) / (maxVoltage - minVoltage) * 100);
+}
+
+// -------------------------- 串口指令监听（触发动作时重置状态机） --------------------------
+void serialListen() {
+    if (Serial.available() > 0) {
+        String cmd = Serial.readStringUntil('\n');
+        cmd.trim();
+        Serial.println("收到指令: " + cmd);
+        
+        // 1. 动作指令：触发时重置对应状态机参数（核心修复）
+        if (cmd == "front") {
+            actionstate = 1;
+            frontAction.currentStep = 0;
+            frontAction.stepStartTime = 0;
+        } else if (cmd == "back") {
+            actionstate = 4;
+            backAction.currentStep = 0;
+            backAction.stepStartTime = 0;
+        } else if (cmd == "left") {
+            actionstate = 2;
+            leftAction.currentStep = 0;
+            leftAction.stepStartTime = 0;
+        } else if (cmd == "right") {
+            actionstate = 3;
+            rightAction.currentStep = 0;
+            rightAction.stepStartTime = 0;
+        } else if (cmd == "toplefthand") {
+            actionstate = 5;
+            topLeftHandAction.currentStep = 0;
+            topLeftHandAction.stepStartTime = 0;
+        } else if (cmd == "toprighthand") {
+            actionstate = 6;
+            topRightHandAction.currentStep = 0;
+            topRightHandAction.stepStartTime = 0;
+        } else if (cmd == "sitdown") {
+            actionstate = 8;
+            sitdownAction.currentStep = 0;
+            sitdownAction.stepStartTime = 0;
+        } else if (cmd == "lie") {
+            actionstate = 7;
+            lieAction.currentStep = 0;
+            lieAction.stepStartTime = 0;
+        } else if (cmd == "dosleep") {
+            actionstate = 10;
+            doSleepAction.currentStep = 0;
+            doSleepAction.stepStartTime = 0;
+        } else if (cmd == "free") {
+            freestate = true;
+            freeModeWaitStart = millis();
+        } else if (cmd == "offfree") {
+            freestate = false;
+        
+        // 2. 表情/功能指令
+        } else if (cmd == "kaixin") emojiState = 0;
+        else if (cmd == "shengqi") emojiState = 1;
+        else if (cmd == "cuowu") emojiState = 2;
+        else if (cmd == "haoqi") emojiState = 3;
+        else if (cmd == "xihuan") emojiState = 4;
+        else if (cmd == "nanshou") emojiState = 5;
+        else if (cmd == "yun") emojiState = 6;
+        else if (cmd == "tianqi") emojiState = 7;
+        else if (cmd == "shijian") emojiState = 8;
+        else if (cmd == "dingwei") emojiState = LOCATION_STATE;
+        
+        // 3. 未知指令
+        else Serial.println("未知指令，忽略执行");
+    }
+}
+
+// -------------------------- 初始化函数 --------------------------
+void setup() {
+    // OLED初始化
+    u8g2.begin();
+    u8g2.setDisplayRotation(U8G2_R2);
+    
+    // 按键中断初始化
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonPress, FALLING);
+    pinMode(BUTTON_PIN2, INPUT);
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN2), handleButtonPress, RISING);
+    
+    // 文件系统初始化
+    SPIFFS.begin();
+    
+    // 舵机初始化（归中）
+    servo1.attach(engine1, 500, 2500);
+    servo2.attach(engine2, 500, 2500);
+    servo3.attach(engine3, 500, 2500);
+    servo4.attach(engine4, 500, 2500);
+    servo1.write(90);
+    servo2.write(90);
+    servo3.write(90);
+    servo4.write(90);
+    
+    // 串口初始化
+    Serial.begin(115200);
+    
+    // AP热点初始化
+    WiFi.softAP(apSsid, apPassword);
+    Serial.println("AP热点启动: " + String(apSsid));
+    Serial.println("AP地址: " + WiFi.softAPIP().toString());
+    
+    // 加载配置+启动Web服务
+    loadWiFiConfig();
+    handleWiFiConfig();
+    
+    // 初始化显示AP信息
+    delay(5000);
+    u8g2.clearDisplay();
+    do {
+        u8g2.setFont(u8g2_font_ncenB08_tr);
+        u8g2.drawXBMP(0, 0, 64, 64, ipip);
+        u8g2.drawStr(64, 10, "WIFI_AP");
+        u8g2.drawStr(64, 27, "RobotDog");
+        u8g2.drawStr(64, 43, "192.168.4.1");
+        u8g2.drawStr(64, 60, "WIFI CTRL");
+    } while (u8g2.nextPage());
+    delay(5000);
+    u8g2.clearDisplay();
+}
+
+// -------------------------- 主循环（非阻塞，millis()驱动） --------------------------
+void loop() {
+    // 1. 串口指令处理（优先：语音/手动指令）
+    if (Serial.available() > 0) {
+        serialListen();
+    }
+    
+    // 2. 电池检测（周期性执行，不影响非阻塞动作）
+    static unsigned long lastBatteryCheck = 0;
+    if (millis() - lastBatteryCheck >= 1000) { // 1秒检测一次电池
+        batteryVoltage = getAverageAdcVoltage() * voltageDividerRatio;
+        batteryPercentage = mapBatteryPercentage(batteryVoltage);
+        lastBatteryCheck = millis();
+    }
+    
+    // 3. 按键处理（触发动作时重置状态机）
+    if (buttonPressed) {
+        buttonPressed = false;
+        actionstate = 1; // 前进
+        frontAction.currentStep = 0;
+        frontAction.stepStartTime = 0;
+    }
+    if (buttonPressed2) {
+        buttonPressed2 = false;
+        actionstate = 4; // 后退
+        backAction.currentStep = 0;
+        backAction.stepStartTime = 0;
+    }
+    
+    // 4. 联网状态更新（非阻塞：仅状态判断，无delay）
+    if (WiFi.status() == WL_CONNECTED) {
+        fetchLocation(); // 已定位则直接返回，不阻塞
+        if (initLocation) {
+            fetchWeather(); // 天气已获取则直接显示，不阻塞
+        }
+        timeClient.update(); // NTP更新非阻塞
+    }
+    
+    // 5. 表情状态清屏（状态变化时执行一次）
+    if (emojiState != prevEmojiState) {
+        u8g2.clearDisplay();
+        prevEmojiState = emojiState;
+    }
+    
+    // 6. 自由模式（millis()实现非阻塞等待）
+    if (freestate) {
+        if (millis() - freeModeWaitStart >= freeModeWaitMs) {
+            actionstate = random(1, 11); // 随机动作（1-10，跳过0）
+            // 自由模式触发动作时，重置对应状态机（关键）
+            switch(actionstate) {
+                case 1: frontAction.currentStep=0; frontAction.stepStartTime=0; break;
+                case 2: leftAction.currentStep=0; leftAction.stepStartTime=0; break;
+                case 3: rightAction.currentStep=0; rightAction.stepStartTime=0; break;
+                case 4: backAction.currentStep=0; backAction.stepStartTime=0; break;
+                case 5: topLeftHandAction.currentStep=0; topLeftHandAction.stepStartTime=0; break;
+                case 6: topRightHandAction.currentStep=0; topRightHandAction.stepStartTime=0; break;
+                case 7: lieAction.currentStep=0; lieAction.stepStartTime=0; break;
+                case 8: sitdownAction.currentStep=0; sitdownAction.stepStartTime=0; break;
+                case 10: doSleepAction.currentStep=0; doSleepAction.stepStartTime=0; break;
+                default: actionstate=0; break;
+            }
+            freeModeWaitStart = millis(); // 重置等待时间
+        }
+    }
+    
+    // 7. 执行非阻塞动作（状态机驱动，millis()判断步骤延时）
+    switch (actionstate) {
+        case 1: frontNonBlock(); break;
+        case 2: leftNonBlock(); break;
+        case 3: rightNonBlock(); break;
+        case 4: backNonBlock(); break;
+        case 5: topLeftHandNonBlock(); break;
+        case 6: topRightHandNonBlock(); break;
+        case 7: lieNonBlock(); break;
+        case 8: sitdownNonBlock(); break;
+        case 10: doSleepNonBlock(); break;
+        case 9: emojiState = random(0,7); actionstate = 0; break; // 随机表情
+        default: break;
+    }
+    
+    // 8. OLED显示（非阻塞：仅绘制，无delay）
+    switch (emojiState) {
+        case 0: do { u8g2.drawXBMP(0,0,128,64,hi); } while(u8g2.nextPage()); break;
+        case 1: do { u8g2.drawXBMP(0,0,128,64,angry); } while(u8g2.nextPage()); break;
+        case 2: do { u8g2.drawXBMP(0,0,128,64,error); } while(u8g2.nextPage()); break;
+        case 3: do { u8g2.drawXBMP(0,0,128,64,dowhat); } while(u8g2.nextPage()); break;
+        case 4: do { u8g2.drawXBMP(0,0,128,64,love); } while(u8g2.nextPage()); break;
+        case 5: do { u8g2.drawXBMP(0,0,128,64,sick); } while(u8g2.nextPage()); break;
+        case 6: do { u8g2.drawXBMP(0,0,128,64,yun); } while(u8g2.nextPage()); break;
+        case 7: fetchWeather(); break;
+        case 8:
+            if (WiFi.status() != WL_CONNECTED) {
+                displayNoNet();
+            } else {
+                timeClient.update();
+                time_t epochTime = timeClient.getEpochTime();
+                struct tm *timeInfo = localtime(&epochTime);
+                do {
+                    u8g2.setFont(u8g2_font_ncenB08_tr);
+                    u8g2.drawXBMP(0,0,64,64,timeimage);
+                    String timeStr = String(timeInfo->tm_hour) + ":" + (timeInfo->tm_min<10?"0":"") + String(timeInfo->tm_min) + ":" + (timeInfo->tm_sec<10?"0":"") + String(timeInfo->tm_sec);
+                    u8g2.drawStr(64,20,timeStr.c_str());
+                    String dateStr = String(timeInfo->tm_year+1900) + "-" + (timeInfo->tm_mon+1<10?"0":"") + String(timeInfo->tm_mon+1) + "-" + (timeInfo->tm_mday<10?"0":"") + String(timeInfo->tm_mday);
+                    u8g2.drawStr(64,35,dateStr.c_str());
+                    String weekDays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+                    u8g2.drawStr(64,50,weekDays[timeInfo->tm_wday].c_str());
+                } while(u8g2.nextPage());
+            }
+            break;
+        case LOCATION_STATE:
+            if (WiFi.status() != WL_CONNECTED) {
+                displayNoNet();
+            } else if (!initLocation) {
+                do {
+                    u8g2.setFont(u8g2_font_ncenB08_tr);
+                    u8g2.drawStr(0, 32, "Getting location...");
+                } while (u8g2.nextPage());
+            } else {
+                do {
+                    u8g2.setFont(u8g2_font_ncenB08_tr);
+                    u8g2.drawStr(0, 16, ("Pro: " + getProvinceEn(province)).c_str());
+                    u8g2.drawStr(0, 32, ("City: " + getCityEn(city)).c_str());
+                    u8g2.drawStr(0, 48, ("Lat: " + String(latitude.toFloat(), 2)).c_str());
+                    u8g2.drawStr(0, 64, ("Lon: " + String(longitude.toFloat(), 2)).c_str());
+                } while(u8g2.nextPage());
+            }
+            break;
+    }
+}
